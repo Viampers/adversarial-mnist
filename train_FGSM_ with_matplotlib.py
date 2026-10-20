@@ -1,3 +1,4 @@
+import csv
 import random
 from pathlib import Path
 import numpy as np
@@ -5,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
 
 # ==================== 随机种子设置 ====================
@@ -31,7 +32,8 @@ print(f"随机种子已设置为: {SEED}")
 PROJECT_DIR = Path(__file__).resolve().parent
 BATCH_SIZE = 64
 LR = 0.001
-EPOCHS = 3
+EPOCHS = 10
+VALIDATION_SIZE = 6000
 EPSILON = 0.2  # 在归一化后的 [-1, 1] 空间施加扰动；对应原始 [0, 1] 空间的 0.1。
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,8 +45,14 @@ transform = transforms.Compose([
     transforms.Normalize((0.5,), (0.5,))  # (x - 0.5) / 0.5，将像素映射到 [-1, 1]。
 ])
 
-train_loader = DataLoader(datasets.MNIST(str(PROJECT_DIR / 'data'), train=True, download=True, transform=transform),
-                          batch_size=BATCH_SIZE, shuffle=True)
+mnist_train = datasets.MNIST(str(PROJECT_DIR / 'data'), train=True, download=True, transform=transform)
+# 独立随机源固定划分；两个模型共享同一训练/验证划分，测试集不参与逐轮评估。
+train_dataset, validation_dataset = random_split(
+    mnist_train, [len(mnist_train) - VALIDATION_SIZE, VALIDATION_SIZE],
+    generator=torch.Generator().manual_seed(SEED)
+)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+validation_loader = DataLoader(validation_dataset, batch_size=1000, shuffle=False)
 test_loader = DataLoader(datasets.MNIST(str(PROJECT_DIR / 'data'), train=False, transform=transform),
                          batch_size=1000, shuffle=False)
 
@@ -92,6 +100,9 @@ def fgsm_attack(model, criterion, images, labels, epsilon):
 def train_model(model, train_loader, optimizer, criterion, device, use_adversarial):
     # use_adversarial=False：干净样本训练；True：仅对抗样本训练。
     model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
     for images, labels in train_loader:
         images, labels = images.to(device), labels.to(device)
 
@@ -103,16 +114,25 @@ def train_model(model, train_loader, optimizer, criterion, device, use_adversari
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
+        # 记录参数更新前的批次指标；对抗训练时两项指标均基于对抗样本。
+        batch_size = labels.size(0)
+        total_loss += loss.item() * batch_size
+        correct += (outputs.argmax(dim=1) == labels).sum().item()
+        total += batch_size
         loss.backward()
         optimizer.step()
 
+    return total_loss / total, 100 * correct / total
+
 # ==================== 6. 评估函数 ====================
-def evaluate_model(model, test_loader, criterion, device, epsilon=EPSILON):
+def evaluate_model(model, test_loader, criterion, device, epsilon=EPSILON,
+                   return_clean_loss=False):
     # eval() 设置评估模式，不会禁用梯度；FGSM 仍需要输入梯度。
     model.eval()
     correct_clean = 0
     correct_adv = 0
     total = 0
+    clean_loss_sum = 0.0
 
 
     for images, labels in test_loader:
@@ -121,6 +141,7 @@ def evaluate_model(model, test_loader, criterion, device, epsilon=EPSILON):
         with torch.no_grad():
             # 1. 干净数据准确率
             outputs_clean = model(images)
+            clean_loss_sum += criterion(outputs_clean, labels).item() * labels.size(0)
             preds_clean = outputs_clean.argmax(dim=1)
             correct_clean += (preds_clean == labels).sum().item()
 
@@ -138,7 +159,71 @@ def evaluate_model(model, test_loader, criterion, device, epsilon=EPSILON):
     # 分母为全部测试样本数，不仅统计原先分类正确的样本。
     clean_acc = 100 * correct_clean / total
     adv_acc = 100 * correct_adv / total
+    if return_clean_loss:
+        return clean_loss_sum / total, clean_acc, adv_acc
     return clean_acc, adv_acc
+
+# ==================== 训练日志与收敛曲线 ====================
+
+def plot_training_history(history, model_name, use_adversarial):
+    """训练损失与干净验证损失的输入口径可能不同，图例明确标注。"""
+    epochs = [row['epoch'] for row in history]
+    train_label = 'FGSM train' if use_adversarial else 'Clean train'
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].plot(epochs, [row['train_loss'] for row in history], label=train_label)
+    axes[0].plot(epochs, [row['validation_loss'] for row in history], label='Clean validation')
+    axes[0].set_ylabel('Mean cross-entropy loss')
+    axes[0].set_title('Loss')
+    axes[1].plot(epochs, [row['train_accuracy'] for row in history], label=train_label)
+    axes[1].plot(epochs, [row['validation_accuracy'] for row in history], label='Clean validation')
+    axes[1].plot(epochs, [row['fgsm_validation_accuracy'] for row in history],
+                 label=f'FGSM validation (epsilon={EPSILON})')
+    axes[1].set_ylabel('Accuracy (%)')
+    axes[1].set_ylim(0, 100)
+    axes[1].set_title('Accuracy')
+    for ax in axes:
+        ax.set_xlabel('Epoch')
+        ax.set_xticks(epochs)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.legend()
+    fig.suptitle(f'{model_name.title()} model training history')
+    fig.tight_layout()
+    fig.savefig(PROJECT_DIR / f'{model_name}_training_curve.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+def train_with_history(model, optimizer, criterion, device, use_adversarial, model_name,
+                       train_loader, validation_loader):
+    """逐轮落盘；Accuracy 单位为百分比，Loss 按样本数加权平均。"""
+    fields = ['epoch', 'train_loss', 'train_accuracy', 'validation_loss',
+              'validation_accuracy', 'fgsm_validation_accuracy', 'train_input', 'epsilon']
+    history = []
+    log_path = PROJECT_DIR / f'{model_name}_training_log.csv'
+    with log_path.open('w', newline='', encoding='utf-8') as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=fields)
+        writer.writeheader()
+        for epoch in range(1, EPOCHS + 1):
+            train_loss, train_acc = train_model(
+                model, train_loader, optimizer, criterion, device, use_adversarial
+            )
+            val_loss, val_acc, val_adv_acc = evaluate_model(
+                model, validation_loader, criterion, device, return_clean_loss=True
+            )
+            row = dict(epoch=epoch, train_loss=train_loss, train_accuracy=train_acc,
+                       validation_loss=val_loss, validation_accuracy=val_acc,
+                       fgsm_validation_accuracy=val_adv_acc,
+                       train_input='fgsm' if use_adversarial else 'clean', epsilon=EPSILON)
+            history.append(row)
+            writer.writerow(row)
+            log_file.flush()
+            train_kind = 'FGSM' if use_adversarial else 'Clean'
+            print(f'Epoch {epoch}/{EPOCHS} | {train_kind} Train Loss: {train_loss:.4f}'
+                  f' | Train Accuracy: {train_acc:.2f}% | Clean Validation Loss: {val_loss:.4f}'
+                  f' | Clean Validation Accuracy: {val_acc:.2f}%'
+                  f' | FGSM Validation Accuracy: {val_adv_acc:.2f}%')
+    plot_training_history(history, model_name, use_adversarial)
+    print(f'训练日志已保存到: {log_path}')
+    return history
 
 # ==================== 7. 主流程：对比实验 ====================
 if __name__ == "__main__":
@@ -151,9 +236,10 @@ if __name__ == "__main__":
     model_normal = VictimNet().to(device)
     optimizer_normal = optim.Adam(model_normal.parameters(), lr=LR)
 
-    for epoch in range(EPOCHS):
-        train_model(model_normal, train_loader, optimizer_normal, criterion, device, use_adversarial=False)
-        print(f"第 {epoch+1} 轮训练完成")
+    history_normal = train_with_history(
+        model_normal, optimizer_normal, criterion, device, False, 'normal',
+        train_loader, validation_loader
+    )
 
     # ---- 阶段二：重新初始化一个独立模型，只用对抗样本训练（非普通模型微调） ----
     print("\n" + "="*50)
@@ -162,9 +248,10 @@ if __name__ == "__main__":
     model_adv = VictimNet().to(device)
     optimizer_adv = optim.Adam(model_adv.parameters(), lr=LR)
 
-    for epoch in range(EPOCHS):
-        train_model(model_adv, train_loader, optimizer_adv, criterion, device, use_adversarial=True)
-        print(f"第 {epoch+1} 轮训练完成")
+    history_adv = train_with_history(
+        model_adv, optimizer_adv, criterion, device, True, 'adv',
+        train_loader, validation_loader
+    )
 
     # state_dict() 提取参数字典，torch.save() 写入文件；同名文件会被覆盖。
     # 不保存优化器状态，供案例脚本加载推理，而非完整恢复训练进度。
